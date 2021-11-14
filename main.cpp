@@ -350,11 +350,11 @@ static DWORD parseNumber(const char* str, const char** end) noexcept {
     return value;
 }
 
-static bool enableLockMemoryPrivilege() noexcept {
+static size_t enableLockMemoryPrivilege() noexcept {
     HANDLE token;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &token)) {
         eprintf("failed to open process token with 0x%08lx\n", GetLastError());
-        return false;
+        return 0;
     }
 
     TOKEN_PRIVILEGES privileges{};
@@ -365,10 +365,11 @@ static bool enableLockMemoryPrivilege() noexcept {
     const bool success = AdjustTokenPrivileges(token, FALSE, &privileges, 0, nullptr, nullptr);
     if (!success) {
         eprintf("failed to adjust token privileges with 0x%08lx\n", GetLastError());
+        return 0;
     }
 
     CloseHandle(token);
-    return success;
+    return GetLargePageMinimum();
 }
 
 #ifdef NDEBUG
@@ -462,13 +463,20 @@ int main() noexcept {
         ExitProcess(1);
     }
 
+    const auto fileSize = GetFileSize(fileHandle, nullptr);
+    auto allocationSize = fileSize;
     DWORD allocationType = MEM_COMMIT | MEM_RESERVE;
-    if (enableLockMemoryPrivilege() && GetLargePageMinimum() != 0) {
+
+    if (const auto min = enableLockMemoryPrivilege()) {
+        allocationSize = (allocationSize + min - 1) & ~(min - 1);
         allocationType |= MEM_LARGE_PAGES;
     }
 
-    const auto fileSize = GetFileSize(fileHandle, nullptr);
-    const auto address = reinterpret_cast<uint8_t*>(VirtualAlloc(nullptr, fileSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    const auto address = reinterpret_cast<uint8_t*>(VirtualAlloc(nullptr, allocationSize, allocationType, PAGE_READWRITE));
+    if (!address) {
+        eprintf("\nfailed to allocate memory with 0x%08lx\n", GetLastError());
+        ExitProcess(1);
+    }
 
     // read file
     {
