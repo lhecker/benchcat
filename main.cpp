@@ -3,10 +3,10 @@
 #define VC_EXTRALEAN
 #define WIN32_LEAN_AND_MEAN
 
+#include <climits>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 
+#include <Shlwapi.h>
 #include <Windows.h>
 
 namespace pcg_engines {
@@ -87,9 +87,236 @@ namespace pcg_engines {
     };
 }// namespace pcg_engines
 
-static DWORD parseNumber(const char* str, char** end) noexcept {
-    char* strEnd = nullptr;
-    auto value = strtoul(str, &strEnd, 10);
+namespace ucrt {
+    // Copyright (c) Microsoft Corporation. All rights reserved.
+    //
+    // This is a copy of "startup/argv_parsing.cpp" from the Windows SDK (10.0.22000.0).
+    // The source code was slightly modified to fit this code style.
+
+    template<typename Character>
+    static bool should_copy_another_character(Character) noexcept {
+        return false;
+    }
+
+    template<typename Character>
+    static void __cdecl parse_command_line(Character* cmdstart, Character** argv, Character* args, size_t* argument_count, size_t* character_count) noexcept {
+        *character_count = 0;
+        *argument_count = 1;// We'll have at least the program name
+
+        Character c;
+        int copy_character; /* 1 = copy char to *args */
+        unsigned numslash;  /* num of backslashes seen */
+
+        /* first scan the program name, copy it, and count the bytes */
+        Character* p = cmdstart;
+        if (argv)
+            *argv++ = args;
+
+        // A quoted program name is handled here. The handling is much
+        // simpler than for other arguments. Basically, whatever lies
+        // between the leading double-quote and next one, or a terminal null
+        // character is simply accepted. Fancier handling is not required
+        // because the program name must be a legal NTFS/HPFS file name.
+        // Note that the double-quote characters are not copied, nor do they
+        // contribute to character_count.
+        bool in_quotes = false;
+        do {
+            if (*p == '"') {
+                in_quotes = !in_quotes;
+                c = *p++;
+                continue;
+            }
+
+            ++*character_count;
+            if (args)
+                *args++ = *p;
+
+            c = *p++;
+
+            if (should_copy_another_character(c)) {
+                ++*character_count;
+                if (args)
+                    *args++ = *p;// Copy 2nd byte too
+                ++p;             // skip over trail byte
+            }
+        } while (c != '\0' && (in_quotes || (c != ' ' && c != '\t')));
+
+        if (c == '\0') {
+            p--;
+        } else {
+            if (args)
+                *(args - 1) = '\0';
+        }
+
+        in_quotes = false;
+
+        // Loop on each argument
+        for (;;) {
+            if (*p) {
+                while (*p == ' ' || *p == '\t')
+                    ++p;
+            }
+
+            if (*p == '\0')
+                break;// End of arguments
+
+            // Scan an argument:
+            if (argv)
+                *argv++ = args;
+
+            ++*argument_count;
+
+            // Loop through scanning one argument:
+            for (;;) {
+                copy_character = 1;
+
+                // Rules:
+                // 2N     backslashes   + " ==> N backslashes and begin/end quote
+                // 2N + 1 backslashes   + " ==> N backslashes + literal "
+                // N      backslashes       ==> N backslashes
+                numslash = 0;
+
+                while (*p == '\\') {
+                    // Count number of backslashes for use below
+                    ++p;
+                    ++numslash;
+                }
+
+                if (*p == '"') {
+                    // if 2N backslashes before, start/end quote, otherwise
+                    // copy literally:
+                    if (numslash % 2 == 0) {
+                        if (in_quotes && p[1] == '"') {
+                            p++;// Double quote inside quoted string
+                        } else {
+                            // Skip first quote char and copy second:
+                            copy_character = 0;// Don't copy quote
+                            in_quotes = !in_quotes;
+                        }
+                    }
+
+                    numslash /= 2;
+                }
+
+                // Copy slashes:
+                while (numslash--) {
+                    if (args)
+                        *args++ = '\\';
+                    ++*character_count;
+                }
+
+                // If at end of arg, break loop:
+                if (*p == '\0' || (!in_quotes && (*p == ' ' || *p == '\t')))
+                    break;
+
+                // Copy character into argument:
+                if (copy_character) {
+                    if (args)
+                        *args++ = *p;
+
+                    if (should_copy_another_character(*p)) {
+                        ++p;
+                        ++*character_count;
+
+                        if (args)
+                            *args++ = *p;
+                    }
+
+                    ++*character_count;
+                }
+
+                ++p;
+            }
+
+            // Null-terminate the argument:
+            if (args)
+                *args++ = '\0';// Terminate the string
+
+            ++*character_count;
+        }
+
+        // We put one last argument in -- a null pointer:
+        if (argv)
+            *argv++ = nullptr;
+
+        ++*argument_count;
+    }
+
+    char* acrt_allocate_buffer_for_argv(size_t const argument_count, size_t const character_count, size_t const character_size) {
+        const size_t argument_array_size = argument_count * sizeof(void*);
+        const size_t character_array_size = character_count * character_size;
+        const size_t total_size = argument_array_size + character_array_size;
+        return reinterpret_cast<char*>(VirtualAlloc(nullptr, total_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    }
+
+    static void common_configure_argv(const char*** argv, int* argc) {
+        const auto command_line = GetCommandLineA();
+
+        size_t argument_count = 0;
+        size_t character_count = 0;
+        ucrt::parse_command_line<char>(command_line, nullptr, nullptr, &argument_count, &character_count);
+
+        const auto buffer = ucrt::acrt_allocate_buffer_for_argv(argument_count, character_count, sizeof(char));
+        const auto first_argument = reinterpret_cast<char**>(buffer);
+        const auto first_string = reinterpret_cast<char*>(buffer + argument_count * sizeof(char*));
+        ucrt::parse_command_line(command_line, first_argument, first_string, &argument_count, &character_count);
+
+        *argv = const_cast<const char**>(first_argument);
+        *argc = argument_count - 1;
+    }
+}// namespace ucrt
+
+// Floating point support stuff for /NODEFAULTLIB
+extern "C" int _fltused = 0;
+
+static unsigned long int parse_decimal(const char* str, const char** endptr) noexcept {
+    static constexpr unsigned long maximumValue = ULONG_MAX / 10;
+
+    unsigned long accumulator = 0;
+
+    for (;; ++str) {
+        if (*str == '\0' || *str < '0' || *str > '9') {
+            break;
+        }
+
+        accumulator = accumulator * 10 + *str - '0';
+        if (accumulator >= maximumValue) {
+            accumulator = ULONG_MAX;
+            break;
+        }
+    }
+
+    if (endptr) {
+        *endptr = str;
+    }
+
+    return accumulator;
+}
+
+static bool has_prefix(const char* str, const char* prefix) noexcept {
+    for (; *prefix != '\0'; ++prefix, ++str) {
+        if (*str != *prefix) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void eprintf(const char* format, ...) noexcept {
+    char buffer[1024];
+    va_list vl;
+    va_start(vl, format);
+    const auto length = wvnsprintfA(buffer, sizeof(buffer), format, vl);
+    va_end(vl);
+
+    if (length) {
+        WriteFile(GetStdHandle(STD_ERROR_HANDLE), buffer, length, nullptr, nullptr);
+    }
+}
+
+static DWORD parseNumber(const char* str, const char** end) noexcept {
+    const char* strEnd = nullptr;
+    auto value = parse_decimal(str, &strEnd);
 
     if (value && strEnd) {
         switch (*strEnd) {
@@ -126,56 +353,77 @@ static DWORD parseNumber(const char* str, char** end) noexcept {
 static bool enableLockMemoryPrivilege() noexcept {
     HANDLE token;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &token)) {
-        fprintf(stderr, "failed to open process token with 0x%08lx\n", GetLastError());
+        eprintf("failed to open process token with 0x%08lx\n", GetLastError());
         return false;
     }
 
     TOKEN_PRIVILEGES privileges{};
     privileges.PrivilegeCount = 1;
-    privileges.Privileges[0].Luid = {4, 0}; // SE_LOCK_MEMORY_NAME is a well known LUID and always {4, 0}
+    privileges.Privileges[0].Luid = {4, 0};// SE_LOCK_MEMORY_NAME is a well known LUID and always {4, 0}
     privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 
     const bool success = AdjustTokenPrivileges(token, FALSE, &privileges, 0, nullptr, nullptr);
     if (!success) {
-        fprintf(stderr, "failed to adjust token privileges with 0x%08lx\n", GetLastError());
+        eprintf("failed to adjust token privileges with 0x%08lx\n", GetLastError());
     }
 
     CloseHandle(token);
     return success;
 }
 
-int main(int argc, const char* argv[]) {
-    SetConsoleOutputCP(CP_UTF8);
+#ifdef NDEBUG
+void __stdcall mainCRTStartup() noexcept {
+#else
+int main() noexcept {
+#endif
+    SetConsoleOutputCP(437);
 
     const char* path = nullptr;
     DWORD chunkSizeBeg = -1;
     DWORD chunkSizeEnd = -1;
     DWORD repeat = 1;
 
-    for (int i = 1; i < argc; ++i) {
-        if (strncmp(argv[i], "-chunk=", 7) == 0) {
-            char* str = nullptr;
-            chunkSizeBeg = parseNumber(argv[i] + 7, &str);
-            if (*str == '-') {
-                chunkSizeEnd = parseNumber(str + 1, nullptr);
+    {
+        const auto command_line = GetCommandLineA();
+
+        size_t argument_count = 0;
+        size_t character_count = 0;
+        ucrt::parse_command_line<char>(command_line, nullptr, nullptr, &argument_count, &character_count);
+
+        const auto buffer = ucrt::acrt_allocate_buffer_for_argv(argument_count, character_count, sizeof(char));
+        const auto first_argument = reinterpret_cast<char**>(buffer);
+        const auto first_string = reinterpret_cast<char*>(buffer + argument_count * sizeof(char*));
+        ucrt::parse_command_line(command_line, first_argument, first_string, &argument_count, &character_count);
+
+        const char** argv;
+        int argc;
+        ucrt::common_configure_argv(&argv, &argc);
+
+        for (int i = 1; i < argc; ++i) {
+            if (has_prefix(argv[i], "-chunk=")) {
+                const char* str = nullptr;
+                chunkSizeBeg = parseNumber(argv[i] + 7, &str);
+                if (*str == '-') {
+                    chunkSizeEnd = parseNumber(str + 1, nullptr);
+                } else {
+                    chunkSizeEnd = chunkSizeBeg;
+                }
+            } else if (has_prefix(argv[i], "-repeat=")) {
+                repeat = parseNumber(argv[i] + 8, nullptr);
             } else {
-                chunkSizeEnd = chunkSizeBeg;
+                path = argv[i];
             }
-        } else if (strncmp(argv[i], "-repeat=", 8) == 0) {
-            repeat = parseNumber(argv[i] + 8, nullptr);
-        } else {
-            path = argv[i];
         }
     }
 
     if (!path || !chunkSizeBeg || !chunkSizeEnd || !repeat) {
-        fprintf(stderr, "Usage: bc <filename>\n");
-        fprintf(stderr, "Flags:\n");
-        fprintf(stderr, "-chunk=xxx[kKmMgG][-xxx[kKmMgG]]:\n");
-        fprintf(stderr, "\tk,m,g for power-of-10 units\n");
-        fprintf(stderr, "\tK,M,G for power-of-2 units\n");
-        fprintf(stderr, "\tthe argument may be given as an inclusive range to randomize chunk sizes\n");
-        return 1;
+        eprintf("Usage: bc <filename>\n");
+        eprintf("Flags:\n");
+        eprintf("-chunk=xxx[kKmMgG][-xxx[kKmMgG]]:\n");
+        eprintf("\tk,m,g for power-of-10 units\n");
+        eprintf("\tK,M,G for power-of-2 units\n");
+        eprintf("\tthe argument may be given as an inclusive range to randomize chunk sizes\n");
+        ExitProcess(1);
     }
 
     if (chunkSizeBeg > chunkSizeEnd) {
@@ -190,14 +438,14 @@ int main(int argc, const char* argv[]) {
     if (chunkSizeEnd != chunkSizeBeg) {
         const auto cryptbase = LoadLibraryExW(L"cryptbase.dll", nullptr, 0);
         if (!cryptbase) {
-            fprintf(stderr, "failed to get handle to cryptbase.dll with 0x%08lx\n", GetLastError());
-            return 1;
+            eprintf("failed to get handle to cryptbase.dll with 0x%08lx\n", GetLastError());
+            ExitProcess(1);
         }
 
         const auto RtlGenRandom = reinterpret_cast<BOOLEAN(APIENTRY*)(PVOID, ULONG)>(GetProcAddress(cryptbase, "SystemFunction036"));
         if (!RtlGenRandom) {
-            fprintf(stderr, "failed to get handle to RtlGenRandom with 0x%08lx\n", GetLastError());
-            return 1;
+            eprintf("failed to get handle to RtlGenRandom with 0x%08lx\n", GetLastError());
+            ExitProcess(1);
         }
 
         uint64_t seed;
@@ -210,8 +458,8 @@ int main(int argc, const char* argv[]) {
     const auto stdoutHandle = GetStdHandle(STD_OUTPUT_HANDLE);
     const auto fileHandle = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (fileHandle == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "failed to open file with 0x%08lx at: %s\n", GetLastError(), path);
-        return 1;
+        eprintf("failed to open file with 0x%08lx at: %s\n", GetLastError(), path);
+        ExitProcess(1);
     }
 
     DWORD allocationType = MEM_COMMIT | MEM_RESERVE;
@@ -227,8 +475,8 @@ int main(int argc, const char* argv[]) {
         auto readAddress = address;
         for (DWORD remaining = fileSize, read = 0; remaining > 0; remaining -= read, readAddress += read) {
             if (!ReadFile(fileHandle, readAddress, remaining, &read, nullptr)) {
-                fprintf(stderr, "\nfailed to read with 0x%08lx\n", GetLastError());
-                return 1;
+                eprintf("\nfailed to read with 0x%08lx\n", GetLastError());
+                ExitProcess(1);
             }
         }
     }
@@ -252,14 +500,26 @@ int main(int argc, const char* argv[]) {
             }
 
             if (!WriteFile(stdoutHandle, writeAddress, written, &written, nullptr)) {
-                fprintf(stderr, "\nfailed to write with 0x%08lx\n", GetLastError());
-                return 1;
+                eprintf("\nfailed to write with 0x%08lx\n", GetLastError());
+                ExitProcess(1);
             }
         }
     }
 
     QueryPerformanceCounter(&end);
-    const auto elapsed = double(end.QuadPart - beg.QuadPart) / double(frequency.QuadPart);
-    fprintf(stdout, "\n--------------------\n%.03fs (%.06f GB/s)\n", elapsed, fileSize / (1'000'000'000.0 * elapsed / double(repeat)));
+
+    const auto elapsed = uint64_t(end.QuadPart - beg.QuadPart) * 1000 / frequency.QuadPart;
+    const auto duration = elapsed / 1000;     // whole seconds
+    const auto durationFract = elapsed % 1000;// remaining milliseconds
+
+    const auto written = uint64_t(fileSize) * repeat;
+    const auto throughput = (written * 1000) / (elapsed * 1000000000);// whole GB
+    const auto throughputFract = (written * 1000) / (elapsed * 1000); // remaining KB
+
+    eprintf("\n--------------------\n%d.%03ds (%d.%06d GB/s)\n", duration, durationFract, throughput, throughputFract);
+    ExitProcess(0);
+
+#ifndef NDEBUG
     return 0;
+#endif
 }
