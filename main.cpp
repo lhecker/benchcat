@@ -314,6 +314,10 @@ static void eprintf(const char* format, ...) noexcept {
     }
 }
 
+static void printLastError(const char* what) noexcept {
+    eprintf("\nfailed to %s with 0x%08lx\n", what, GetLastError());
+}
+
 static DWORD parseNumber(const char* str, const char** end) noexcept {
     const char* strEnd = nullptr;
     auto value = parse_decimal(str, &strEnd);
@@ -353,7 +357,7 @@ static DWORD parseNumber(const char* str, const char** end) noexcept {
 static size_t enableLockMemoryPrivilege() noexcept {
     HANDLE token;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &token)) {
-        eprintf("failed to open process token with 0x%08lx\n", GetLastError());
+        printLastError("open process token");
         return 0;
     }
 
@@ -364,7 +368,7 @@ static size_t enableLockMemoryPrivilege() noexcept {
 
     const bool success = AdjustTokenPrivileges(token, FALSE, &privileges, 0, nullptr, nullptr);
     if (!success) {
-        eprintf("failed to adjust token privileges with 0x%08lx\n", GetLastError());
+        printLastError("adjust token privileges");
         return 0;
     }
 
@@ -377,12 +381,13 @@ void __stdcall mainCRTStartup() noexcept {
 #else
 int main() noexcept {
 #endif
-    SetConsoleOutputCP(437);
+    SetConsoleOutputCP(CP_UTF8);
 
     const char* path = nullptr;
     DWORD chunkSizeBeg = -1;
     DWORD chunkSizeEnd = -1;
     DWORD repeat = 1;
+    DWORD vt = 0;
 
     {
         const auto command_line = GetCommandLineA();
@@ -411,6 +416,11 @@ int main() noexcept {
                 }
             } else if (has_prefix(argv[i], "-repeat=")) {
                 repeat = parseNumber(argv[i] + 8, nullptr);
+            } else if (has_prefix(argv[i], "-vt=")) {
+                vt = parseNumber(argv[i] + 4, nullptr);
+            } else if (path) {
+                path = nullptr;
+                break;
             } else {
                 path = argv[i];
             }
@@ -418,12 +428,18 @@ int main() noexcept {
     }
 
     if (!path || !chunkSizeBeg || !chunkSizeEnd || !repeat) {
-        eprintf("Usage: bc <filename>\n");
-        eprintf("Flags:\n");
-        eprintf("-chunk=xxx[kKmMgG][-xxx[kKmMgG]]:\n");
-        eprintf("\tk,m,g for power-of-10 units\n");
-        eprintf("\tK,M,G for power-of-2 units\n");
-        eprintf("\tthe argument may be given as an inclusive range to randomize chunk sizes\n");
+        eprintf(
+            "bc <filename>\n"
+            "\t-chunk={d}[kKmMgG][-{d}[kKmMgG]]\n"
+            "\t\tThe argument may be given as an range (inclusive) to randomize chunk sizes.\n"
+            "\t\tDefaults to writing the file in a single WriteFile() call.\n"
+            "\t-repeat={d}[kKmMgG]\n"
+            "\t-vt={b}\n"
+            "\n"
+            "{b} is a single bit (0 or 1)\n"
+            "{d} are base-10 digits\n"
+            "\tk,m,g are base-10 units\n"
+            "\tK,M,G are base-2 units\n");
         ExitProcess(1);
     }
 
@@ -437,15 +453,15 @@ int main() noexcept {
     DWORD chunkSizeRange = 0;
 
     if (chunkSizeEnd != chunkSizeBeg) {
-        const auto cryptbase = LoadLibraryExW(L"cryptbase.dll", nullptr, 0);
+        const auto cryptbase = LoadLibraryExA("cryptbase.dll", nullptr, 0);
         if (!cryptbase) {
-            eprintf("failed to get handle to cryptbase.dll with 0x%08lx\n", GetLastError());
+            printLastError("get handle to cryptbase.dll");
             ExitProcess(1);
         }
 
         const auto RtlGenRandom = reinterpret_cast<BOOLEAN(APIENTRY*)(PVOID, ULONG)>(GetProcAddress(cryptbase, "SystemFunction036"));
         if (!RtlGenRandom) {
-            eprintf("failed to get handle to RtlGenRandom with 0x%08lx\n", GetLastError());
+            printLastError("get handle to RtlGenRandom");
             ExitProcess(1);
         }
 
@@ -459,23 +475,22 @@ int main() noexcept {
     const auto stdoutHandle = GetStdHandle(STD_OUTPUT_HANDLE);
     const auto fileHandle = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (fileHandle == INVALID_HANDLE_VALUE) {
-        eprintf("failed to open file with 0x%08lx at: %s\n", GetLastError(), path);
+        printLastError("open file");
         ExitProcess(1);
     }
 
     const auto fileSize = GetFileSize(fileHandle, nullptr);
-    auto allocationSize = fileSize;
-    DWORD allocationType = MEM_COMMIT | MEM_RESERVE;
 
+    uint8_t* address = nullptr;
     if (const auto min = enableLockMemoryPrivilege()) {
-        allocationSize = (allocationSize + min - 1) & ~(min - 1);
-        allocationType |= MEM_LARGE_PAGES;
+        address = reinterpret_cast<uint8_t*>(VirtualAlloc(nullptr, (fileSize + min - 1) & ~(min - 1), MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES, PAGE_READWRITE));
     }
-
-    const auto address = reinterpret_cast<uint8_t*>(VirtualAlloc(nullptr, allocationSize, allocationType, PAGE_READWRITE));
     if (!address) {
-        eprintf("\nfailed to allocate memory with 0x%08lx\n", GetLastError());
-        ExitProcess(1);
+        address = reinterpret_cast<uint8_t*>(VirtualAlloc(nullptr, fileSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        if (!address) {
+            printLastError("allocate memory");
+            ExitProcess(1);
+        }
     }
 
     // read file
@@ -483,9 +498,22 @@ int main() noexcept {
         auto readAddress = address;
         for (DWORD remaining = fileSize, read = 0; remaining > 0; remaining -= read, readAddress += read) {
             if (!ReadFile(fileHandle, readAddress, remaining, &read, nullptr)) {
-                eprintf("\nfailed to read with 0x%08lx\n", GetLastError());
+                printLastError("read");
                 ExitProcess(1);
             }
+        }
+    }
+
+    {
+        DWORD consoleMode;
+        if (!GetConsoleMode(stdoutHandle, &consoleMode)) {
+            printLastError("get console mode");
+        }
+
+        consoleMode = (consoleMode & ~(ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN)) | (vt ? ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN : 0);
+
+        if (!SetConsoleMode(stdoutHandle, consoleMode)) {
+            printLastError("set console mode");
         }
     }
 
@@ -508,7 +536,7 @@ int main() noexcept {
             }
 
             if (!WriteFile(stdoutHandle, writeAddress, written, &written, nullptr)) {
-                eprintf("\nfailed to write with 0x%08lx\n", GetLastError());
+                printLastError("write");
                 ExitProcess(1);
             }
         }
@@ -516,15 +544,16 @@ int main() noexcept {
 
     QueryPerformanceCounter(&end);
 
-    const auto elapsed = uint64_t(end.QuadPart - beg.QuadPart) * 1000 / frequency.QuadPart;
-    const auto duration = elapsed / 1000;     // whole seconds
-    const auto durationFract = elapsed % 1000;// remaining milliseconds
+    const auto elapsedCounter = uint64_t(end.QuadPart - beg.QuadPart);
+    const auto elapsedMS = (elapsedCounter * 1000) / frequency.QuadPart;
+    const auto duration = elapsedMS / 1000;     // whole seconds
+    const auto durationFract = elapsedMS % 1000;// remaining milliseconds
 
     const auto written = uint64_t(fileSize) * repeat;
-    const auto throughput = (written * 1000) / (elapsed * 1000000000);// whole GB
-    const auto throughputFract = (written * 1000) / (elapsed * 1000); // remaining KB
+    const auto throughput = (written * frequency.QuadPart) / (elapsedCounter * 1000000000);// whole GB
+    const auto throughputFract = (written * frequency.QuadPart) / (elapsedCounter * 1000); // remaining KB
 
-    eprintf("\n--------------------\n%d.%03ds (%d.%06d GB/s)\n", duration, durationFract, throughput, throughputFract);
+    eprintf("\r\n--------------------\r\n%d.%03ds (%d.%06d GB/s)\r\n", duration, durationFract, throughput, throughputFract);
     ExitProcess(0);
 
 #ifndef NDEBUG
