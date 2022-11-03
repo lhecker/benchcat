@@ -8,6 +8,7 @@
 
 #include <Shlwapi.h>
 #include <Windows.h>
+#include <icu.h>
 
 namespace pcg_engines {
     /*
@@ -266,9 +267,6 @@ namespace ucrt {
     }
 }// namespace ucrt
 
-// Floating point support stuff for /NODEFAULTLIB
-extern "C" int _fltused = 0;
-
 static unsigned long int parse_decimal(const char* str, const char** endptr) noexcept {
     static constexpr unsigned long maximumValue = ULONG_MAX / 10;
 
@@ -315,7 +313,7 @@ static void eprintf(const char* format, ...) noexcept {
 }
 
 static void printLastError(const char* what) noexcept {
-    eprintf("\nfailed to %s with 0x%08lx\n", what, GetLastError());
+    eprintf("\r\nfailed to %s with 0x%08lx\r\n", what, GetLastError());
 }
 
 static DWORD parseNumber(const char* str, const char** end) noexcept {
@@ -363,7 +361,7 @@ static size_t enableLockMemoryPrivilege() noexcept {
 
     TOKEN_PRIVILEGES privileges{};
     privileges.PrivilegeCount = 1;
-    privileges.Privileges[0].Luid = {4, 0};// SE_LOCK_MEMORY_NAME is a well known LUID and always {4, 0}
+    privileges.Privileges[0].Luid = {4, 0};// SE_LOCK_MEMORY_PRIVILEGE is a well known LUID and always {4, 0}
     privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 
     const bool success = AdjustTokenPrivileges(token, FALSE, &privileges, 0, nullptr, nullptr);
@@ -376,7 +374,55 @@ static size_t enableLockMemoryPrivilege() noexcept {
     return GetLargePageMinimum();
 }
 
-#ifdef NDEBUG
+static size_t largePageMinimum = 0;
+
+static char* allocate(size_t size) {
+    char* address = nullptr;
+    if (largePageMinimum) {
+        address = static_cast<char*>(VirtualAlloc(nullptr, (size + largePageMinimum - 1) & ~(largePageMinimum - 1), MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES, PAGE_READWRITE));
+    }
+    if (!address) {
+        address = static_cast<char*>(VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        if (!address) {
+            printLastError("allocate memory");
+            ExitProcess(1);
+        }
+    }
+    return address;
+}
+
+inline char* memcpyAppend(char* dst, const void* src, size_t size) {
+    memcpy(dst, src, size);
+    return dst + size;
+}
+
+inline char* memcpyAppend(char* dst, const char* src) {
+    return memcpyAppend(dst, src, __builtin_strlen(src));
+}
+
+static constexpr char stringTable256[]{"0123456789101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899100101102103104105106107108109110111112113114115116117118119120121122123124125126127128129130131132133134135136137138139140141142143144145146147148149150151152153154155156157158159160161162163164165166167168169170171172173174175176177178179180181182183184185186187188189190191192193194195196197198199200201202203204205206207208209210211212213214215216217218219220221222223224225226227228229230231232233234235236237238239240241242243244245246247248249250251252253254255"};
+static constexpr uint16_t stringTable256Offsets[]{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 66, 68, 70, 72, 74, 76, 78, 80, 82, 84, 86, 88, 90, 92, 94, 96, 98, 100, 102, 104, 106, 108, 110, 112, 114, 116, 118, 120, 122, 124, 126, 128, 130, 132, 134, 136, 138, 140, 142, 144, 146, 148, 150, 152, 154, 156, 158, 160, 162, 164, 166, 168, 170, 172, 174, 176, 178, 180, 182, 184, 186, 188, 190, 193, 196, 199, 202, 205, 208, 211, 214, 217, 220, 223, 226, 229, 232, 235, 238, 241, 244, 247, 250, 253, 256, 259, 262, 265, 268, 271, 274, 277, 280, 283, 286, 289, 292, 295, 298, 301, 304, 307, 310, 313, 316, 319, 322, 325, 328, 331, 334, 337, 340, 343, 346, 349, 352, 355, 358, 361, 364, 367, 370, 373, 376, 379, 382, 385, 388, 391, 394, 397, 400, 403, 406, 409, 412, 415, 418, 421, 424, 427, 430, 433, 436, 439, 442, 445, 448, 451, 454, 457, 460, 463, 466, 469, 472, 475, 478, 481, 484, 487, 490, 493, 496, 499, 502, 505, 508, 511, 514, 517, 520, 523, 526, 529, 532, 535, 538, 541, 544, 547, 550, 553, 556, 559, 562, 565, 568, 571, 574, 577, 580, 583, 586, 589, 592, 595, 598, 601, 604, 607, 610, 613, 616, 619, 622, 625, 628, 631, 634, 637, 640, 643, 646, 649, 652, 655, 658};
+
+char* decimalAppend256(char* dst, size_t val) {
+    const auto off0 = stringTable256Offsets[val];
+    const auto off1 = stringTable256Offsets[val + 1];
+
+    for (auto i = off0; i < off1; ++i) {
+        *dst++ = stringTable256[i];
+    }
+
+    return dst;
+}
+
+
+enum class VtMode {
+    Off,
+    On,
+    Italic,
+    Color
+};
+
+#ifdef NODEFAULTLIB
 void __stdcall mainCRTStartup() noexcept {
 #else
 int main() noexcept {
@@ -384,10 +430,10 @@ int main() noexcept {
     SetConsoleOutputCP(CP_UTF8);
 
     const char* path = nullptr;
-    DWORD chunkSizeBeg = -1;
-    DWORD chunkSizeEnd = -1;
+    DWORD chunkSizeBeg = 1073741824;// maximum buffer size WriteFile seems to accept
+    DWORD chunkSizeEnd = 1073741824;
     DWORD repeat = 1;
-    DWORD vt = 0;
+    VtMode vt = VtMode::Off;
 
     {
         const auto command_line = GetCommandLineA();
@@ -416,8 +462,12 @@ int main() noexcept {
                 }
             } else if (has_prefix(argv[i], "-repeat=")) {
                 repeat = parseNumber(argv[i] + 8, nullptr);
-            } else if (has_prefix(argv[i], "-vt=")) {
-                vt = parseNumber(argv[i] + 4, nullptr);
+            } else if (has_prefix(argv[i], "-vt=on")) {
+                vt = VtMode::On;
+            } else if (has_prefix(argv[i], "-vt=italic")) {
+                vt = VtMode::Italic;
+            } else if (has_prefix(argv[i], "-vt=color")) {
+                vt = VtMode::Color;
             } else if (path) {
                 path = nullptr;
                 break;
@@ -429,30 +479,24 @@ int main() noexcept {
 
     if (!path || !chunkSizeBeg || !chunkSizeEnd || !repeat) {
         eprintf(
-            "bc <filename>\n"
-            "\t-chunk={d}[kKmMgG][-{d}[kKmMgG]]\n"
-            "\t\tThe argument may be given as an range (inclusive) to randomize chunk sizes.\n"
-            "\t\tDefaults to writing the file in a single WriteFile() call.\n"
-            "\t-repeat={d}[kKmMgG]\n"
-            "\t-vt={b}\n"
-            "\n"
-            "{b} is a single bit (0 or 1)\n"
-            "{d} are base-10 digits\n"
-            "\tk,m,g are base-10 units\n"
-            "\tK,M,G are base-2 units\n");
+            "bc <filename>\r\n"
+            "\t-chunk={d}[kKmMgG][-{d}[kKmMgG]]\r\n"
+            "\t\tThe argument may be given as an range (inclusive) to randomize chunk sizes.\r\n"
+            "\t\tDefaults to writing the file in a single WriteFile() call.\r\n"
+            "\t-repeat={d}[kKmMgG]\r\n"
+            "\t-vt=(on|italic|color)\r\n"
+            "\r\n"
+            "{b} is a single bit (0 or 1)\r\n"
+            "{d} are base-10 digits\r\n"
+            "\tk,m,g are base-10 units\r\n"
+            "\tK,M,G are base-2 units\r\n");
         ExitProcess(1);
     }
 
-    if (chunkSizeBeg > chunkSizeEnd) {
-        const auto tmp = chunkSizeBeg;
-        chunkSizeBeg = chunkSizeEnd;
-        chunkSizeEnd = tmp;
-    }
+    largePageMinimum = enableLockMemoryPrivilege();
 
     pcg_engines::oneseq_dxsm_64_32 rng;
-    DWORD chunkSizeRange = 0;
-
-    if (chunkSizeEnd != chunkSizeBeg) {
+    {
         const auto cryptbase = LoadLibraryExA("cryptbase.dll", nullptr, 0);
         if (!cryptbase) {
             printLastError("get handle to cryptbase.dll");
@@ -469,6 +513,15 @@ int main() noexcept {
         RtlGenRandom(&seed, sizeof(seed));
 
         rng = pcg_engines::oneseq_dxsm_64_32{seed};
+    }
+
+    DWORD chunkSizeRange = 0;
+    if (chunkSizeBeg > chunkSizeEnd) {
+        const auto tmp = chunkSizeBeg;
+        chunkSizeBeg = chunkSizeEnd;
+        chunkSizeEnd = tmp;
+    }
+    if (chunkSizeEnd != chunkSizeBeg) {
         chunkSizeRange = chunkSizeEnd - chunkSizeBeg + 1;
     }
 
@@ -480,22 +533,13 @@ int main() noexcept {
     }
 
     const auto fileSize = GetFileSize(fileHandle, nullptr);
-
-    uint8_t* address = nullptr;
-    if (const auto min = enableLockMemoryPrivilege()) {
-        address = reinterpret_cast<uint8_t*>(VirtualAlloc(nullptr, (fileSize + min - 1) & ~(min - 1), MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES, PAGE_READWRITE));
-    }
-    if (!address) {
-        address = reinterpret_cast<uint8_t*>(VirtualAlloc(nullptr, fileSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-        if (!address) {
-            printLastError("allocate memory");
-            ExitProcess(1);
-        }
-    }
+    const auto fileData = allocate(fileSize);
+    auto writeSize = fileSize;
+    auto writeData = fileData;
 
     // read file
     {
-        auto readAddress = address;
+        auto readAddress = fileData;
         for (DWORD remaining = fileSize, read = 0; remaining > 0; remaining -= read, readAddress += read) {
             if (!ReadFile(fileHandle, readAddress, remaining, &read, nullptr)) {
                 printLastError("read");
@@ -504,17 +548,70 @@ int main() noexcept {
         }
     }
 
+    // enable/disable VT
     {
-        DWORD consoleMode;
+        DWORD consoleMode = 0;
         if (!GetConsoleMode(stdoutHandle, &consoleMode)) {
             printLastError("get console mode");
         }
 
-        consoleMode = (consoleMode & ~(ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN)) | (vt ? ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN : 0);
+        auto consoleModeNew = consoleMode;
+        consoleModeNew &= ~(ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN);
+        consoleModeNew |= vt != VtMode::Off ? ENABLE_VIRTUAL_TERMINAL_PROCESSING : 0;
 
-        if (!SetConsoleMode(stdoutHandle, consoleMode)) {
+        if (consoleModeNew != consoleMode && !SetConsoleMode(stdoutHandle, consoleModeNew)) {
             printLastError("set console mode");
         }
+    }
+
+    // preprocess file with vt options
+    switch (vt) {
+        case VtMode::Italic: {
+            writeData = allocate(fileSize + 16);
+            auto p = writeData;
+            p = memcpyAppend(p, "\x1b[3m");
+            p = memcpyAppend(p, fileData, fileSize);
+            p = memcpyAppend(p, "\x1b[0m");
+            writeSize = p - writeData;
+            break;
+        }
+        case VtMode::Color: {
+            const auto icu = LoadLibraryExW(L"icuuc.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            if (icu) {
+                writeData = allocate(fileSize * 20 + 8);
+                auto p = writeData;
+
+                const auto utextOpenUTF8 = reinterpret_cast<decltype(&utext_openUTF8)>(GetProcAddress(icu, "utext_openUTF8"));
+                const auto ubrkOpen = reinterpret_cast<decltype(&ubrk_open)>(GetProcAddress(icu, "ubrk_open"));
+                const auto ubrkSetUText = reinterpret_cast<decltype(&ubrk_setUText)>(GetProcAddress(icu, "ubrk_setUText"));
+                const auto ubrkNext = reinterpret_cast<decltype(&ubrk_next)>(GetProcAddress(icu, "ubrk_next"));
+
+                auto error = U_ZERO_ERROR;
+
+                UText text = UTEXT_INITIALIZER;
+                utextOpenUTF8(&text, fileData, fileSize, &error);
+
+                const auto it = ubrkOpen(UBRK_CHARACTER, "", nullptr, 0, &error);
+                ubrkSetUText(it, &text, &error);
+
+                for (int32_t ubrk0 = 0, ubrk1; (ubrk1 = ubrkNext(it)) != UBRK_DONE; ubrk0 = ubrk1) {
+                    p = memcpyAppend(p, "\x1b[38;2");
+                    for (int i = 0; i < 3; i++) {
+                        const auto v = rng(256);
+                        *p++ = ';';
+                        p = decimalAppend256(p, v);
+                    }
+                    p = memcpyAppend(p, "m");
+                    p = memcpyAppend(p, fileData + ubrk0, ubrk1 - ubrk0);
+                }
+
+                p = memcpyAppend(p, "\x1b[39;49m");
+                writeSize = p - writeData;
+            }
+            break;
+        }
+        default:
+            break;
     }
 
     LARGE_INTEGER frequency, beg, end;
@@ -523,8 +620,8 @@ int main() noexcept {
 
     // write file
     for (DWORD iteration = 0; iteration < repeat; ++iteration) {
-        auto writeAddress = address;
-        for (DWORD remaining = fileSize, written = 0; remaining > 0; remaining -= written, writeAddress += written) {
+        auto writeAddress = writeData;
+        for (DWORD remaining = writeSize, written = 0; remaining > 0; remaining -= written, writeAddress += written) {
             auto chunkSize = chunkSizeBeg;
             if (chunkSizeRange) {
                 chunkSize += rng(chunkSizeRange);
@@ -549,7 +646,7 @@ int main() noexcept {
     const auto duration = elapsedMS / 1000;     // whole seconds
     const auto durationFract = elapsedMS % 1000;// remaining milliseconds
 
-    const auto written = uint64_t(fileSize) * repeat;
+    const auto written = uint64_t(writeSize) * repeat;
     const auto throughput = (written * frequency.QuadPart) / (elapsedCounter * 1000000000);// whole GB
     const auto throughputFract = (written * frequency.QuadPart) / (elapsedCounter * 1000); // remaining KB
 
