@@ -267,6 +267,10 @@ namespace ucrt {
     }
 }// namespace ucrt
 
+constexpr LONGLONG fract_round(LONGLONG dividend, LONGLONG divisor) {
+    return ((dividend + divisor / 2) / divisor) % 1000;
+}
+
 static unsigned long int parse_decimal(const char* str, const char** endptr) noexcept {
     static constexpr unsigned long maximumValue = ULONG_MAX / 10;
 
@@ -301,13 +305,14 @@ static bool has_prefix(const char* str, const char* prefix) noexcept {
 }
 
 static void eprintf(const char* format, ...) noexcept {
-    char buffer[1024];
+    char buffer[256];
+
     va_list vl;
     va_start(vl, format);
     const auto length = wvnsprintfA(buffer, sizeof(buffer), format, vl);
     va_end(vl);
 
-    if (length) {
+    if (length > 0) {
         WriteFile(GetStdHandle(STD_ERROR_HANDLE), buffer, length, nullptr, nullptr);
     }
 }
@@ -434,6 +439,8 @@ int main() noexcept {
     DWORD chunkSizeEnd = 1073741824;
     DWORD repeat = 1;
     VtMode vt = VtMode::Off;
+    uint64_t seed = 0;
+    bool seedParam = false;
 
     {
         const auto command_line = GetCommandLineA();
@@ -468,6 +475,9 @@ int main() noexcept {
                 vt = VtMode::Italic;
             } else if (has_prefix(argv[i], "-vt=color")) {
                 vt = VtMode::Color;
+            } else if (has_prefix(argv[i], "-seed=")) {
+                seed = parseNumber(argv[i] + 6, nullptr);
+                seedParam = true;
             } else if (path) {
                 path = nullptr;
                 break;
@@ -485,6 +495,7 @@ int main() noexcept {
             "\t\tDefaults to writing the file in a single WriteFile() call.\r\n"
             "\t-repeat={d}[kKmMgG]\r\n"
             "\t-vt=(on|italic|color)\r\n"
+            "\t-seed={d}\r\n"
             "\r\n"
             "{b} is a single bit (0 or 1)\r\n"
             "{d} are base-10 digits\r\n"
@@ -495,8 +506,7 @@ int main() noexcept {
 
     largePageMinimum = enableLockMemoryPrivilege();
 
-    pcg_engines::oneseq_dxsm_64_32 rng;
-    {
+    if (!seedParam) {
         const auto cryptbase = LoadLibraryExA("cryptbase.dll", nullptr, 0);
         if (!cryptbase) {
             printLastError("get handle to cryptbase.dll");
@@ -509,11 +519,10 @@ int main() noexcept {
             ExitProcess(1);
         }
 
-        uint64_t seed;
         RtlGenRandom(&seed, sizeof(seed));
-
-        rng = pcg_engines::oneseq_dxsm_64_32{seed};
     }
+
+    pcg_engines::oneseq_dxsm_64_32 rng{seed};
 
     DWORD chunkSizeRange = 0;
     if (chunkSizeBeg > chunkSizeEnd) {
@@ -641,16 +650,46 @@ int main() noexcept {
 
     QueryPerformanceCounter(&end);
 
-    const auto elapsedCounter = uint64_t(end.QuadPart - beg.QuadPart);
-    const auto elapsedMS = (elapsedCounter * 1000) / frequency.QuadPart;
-    const auto duration = elapsedMS / 1000;     // whole seconds
-    const auto durationFract = elapsedMS % 1000;// remaining milliseconds
+    const auto elapsedCounter = end.QuadPart - beg.QuadPart;
+    const auto elapsedUS = (elapsedCounter * 1'000'000) / frequency.QuadPart;
+    const auto written = static_cast<LONGLONG>(writeSize) * repeat;
+    const auto bytesPerSecond = (written * frequency.QuadPart) / elapsedCounter;
 
-    const auto written = uint64_t(writeSize) * repeat;
-    const auto throughput = (written * frequency.QuadPart) / (elapsedCounter * 1000000000);// whole GB
-    const auto throughputFract = (written * frequency.QuadPart) / (elapsedCounter * 1000); // remaining KB
+    LONGLONG duration;
+    LONGLONG durationFract;
+    const char* durationSuffix;
+    if (elapsedUS >= 1'000'000) {
+        duration = elapsedUS / 1'000'000;
+        durationFract = fract_round(elapsedUS, 1'000);
+        durationSuffix = "";
+    } else {
+        duration = elapsedUS / 1'000;
+        durationFract = elapsedUS % 1'000;
+        durationSuffix = "m";
+    }
 
-    eprintf("\r\n--------------------\r\n%d.%03ds (%d.%06d GB/s)\r\n", duration, durationFract, throughput, throughputFract);
+    LONGLONG throughput;
+    LONGLONG throughputFract;
+    const char* throughputSuffix;
+    if (bytesPerSecond >= 1'000'000'000) {
+        throughput = bytesPerSecond / 1'000'000'000;
+        throughputFract = fract_round(bytesPerSecond, 1'000'000);
+        throughputSuffix = "G";
+    } else if (bytesPerSecond >= 1'000'000) {
+        throughput = bytesPerSecond / 1'000'000;
+        throughputFract = fract_round(bytesPerSecond, 1'000);
+        throughputSuffix = "M";
+    } else if (bytesPerSecond >= 1'000) {
+        throughput = bytesPerSecond / 1'000;
+        throughputFract = bytesPerSecond % 1'000;
+        throughputSuffix = "k";
+    } else {
+        throughput = 0;
+        throughputFract = bytesPerSecond;
+        throughputSuffix = "";
+    }
+
+    eprintf("\r\n------------------------\r\n%lld.%03lld%ss (%lld.%03lld %sB/s)\r\n", duration, durationFract, durationSuffix, throughput, throughputFract, throughputSuffix);
     ExitProcess(0);
 
 #ifndef NDEBUG
